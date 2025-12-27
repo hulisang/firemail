@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Users, Mail } from 'lucide-react';
+import { Users } from 'lucide-react';
 import EmailManagement from '../components/EmailManagement';
 import { ModeToggle } from '../components/mode-toggle';
 import type { EmailAccount } from '../types';
@@ -32,7 +32,6 @@ export default function Dashboard() {
             {/* 顶部导航 */}
             <header className="top-header">
                 <div className="header-logo">
-                    <Mail size={18} className="text-primary" />
                     FlareMail
                 </div>
 
