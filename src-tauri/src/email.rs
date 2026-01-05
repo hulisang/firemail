@@ -62,7 +62,7 @@ pub struct EmailAccount {
 }
 
 /// 邮件记录
-#[derive(Debug, sqlx::FromRow, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize, serde::Deserialize)]
 pub struct MailRecord {
     pub id: i64,
     pub email_id: i64,
@@ -100,6 +100,7 @@ pub struct CheckResult {
     pub success: bool,
     pub fetched: usize,
     pub saved: usize,
+    pub deleted: usize,
     pub message: String,
 }
 
@@ -428,6 +429,7 @@ pub async fn check_outlook_email(
 
     let mut fetched = 0usize;
     let mut saved = 0usize;
+    let mut server_mail_ids: Vec<MailIdentifier> = Vec::new();
 
     // 根据 API 模式选择收件方式
     let used_mode = match api_mode {
@@ -435,8 +437,15 @@ pub async fn check_outlook_email(
             // 使用 Graph API 收件，失败时回退到 IMAP
             match graph_api::fetch_via_graph(&access_token, &folder, 100, &proxy_config).await {
                 Ok(records) => {
-                    for record in records {
+                    for record in &records {
                         fetched += 1;
+
+                        // 收集服务器邮件标识
+                        server_mail_ids.push(MailIdentifier {
+                            subject: record.subject.clone(),
+                            sender: record.sender.clone(),
+                            received_time: record.received_time.clone(),
+                        });
 
                         // 构建兼容的记录用于去重检查
                         let fetch_record = MailFetchRecord {
@@ -487,13 +496,16 @@ pub async fn check_outlook_email(
                     })
                     .await?;
 
-                    for record in fetch_result? {
+                    let (records, server_ids) = fetch_result?;
+                    server_mail_ids = server_ids;
+                    for record in &records {
                         fetched += 1;
-                        if mail_record_exists(pool, email_id, &record).await? {
+
+                        if mail_record_exists(pool, email_id, record).await? {
                             continue;
                         }
 
-                        let mail_id = insert_mail_record(pool, email_id, &record).await?;
+                        let mail_id = insert_mail_record(pool, email_id, record).await?;
                         saved += 1;
 
                         if !record.attachments.is_empty() {
@@ -524,14 +536,16 @@ pub async fn check_outlook_email(
             .await?;
 
             match fetch_result {
-                Ok(records) => {
-                    for record in records {
+                Ok((records, server_ids)) => {
+                    server_mail_ids = server_ids;
+                    for record in &records {
                         fetched += 1;
-                        if mail_record_exists(pool, email_id, &record).await? {
+
+                        if mail_record_exists(pool, email_id, record).await? {
                             continue;
                         }
 
-                        let mail_id = insert_mail_record(pool, email_id, &record).await?;
+                        let mail_id = insert_mail_record(pool, email_id, record).await?;
                         saved += 1;
 
                         if !record.attachments.is_empty() {
@@ -554,8 +568,15 @@ pub async fn check_outlook_email(
                         graph_api::fetch_via_graph(&access_token, &folder, 100, &proxy_config)
                             .await?;
 
-                    for record in records {
+                    for record in &records {
                         fetched += 1;
+
+                        // 收集服务器邮件标识
+                        server_mail_ids.push(MailIdentifier {
+                            subject: record.subject.clone(),
+                            sender: record.sender.clone(),
+                            received_time: record.received_time.clone(),
+                        });
 
                         let fetch_record = MailFetchRecord {
                             subject: record.subject.clone(),
@@ -597,8 +618,15 @@ pub async fn check_outlook_email(
 
             match graph_api::fetch_via_graph(&access_token, &folder, 100, &proxy_config).await {
                 Ok(records) => {
-                    for record in records {
+                    for record in &records {
                         fetched += 1;
+
+                        // 收集服务器邮件标识
+                        server_mail_ids.push(MailIdentifier {
+                            subject: record.subject.clone(),
+                            sender: record.sender.clone(),
+                            received_time: record.received_time.clone(),
+                        });
 
                         let fetch_record = MailFetchRecord {
                             subject: record.subject.clone(),
@@ -650,13 +678,16 @@ pub async fn check_outlook_email(
                     })
                     .await?;
 
-                    for record in fetch_result? {
+                    let (records, server_ids) = fetch_result?;
+                    server_mail_ids = server_ids;
+                    for record in &records {
                         fetched += 1;
-                        if mail_record_exists(pool, email_id, &record).await? {
+
+                        if mail_record_exists(pool, email_id, record).await? {
                             continue;
                         }
 
-                        let mail_id = insert_mail_record(pool, email_id, &record).await?;
+                        let mail_id = insert_mail_record(pool, email_id, record).await?;
                         saved += 1;
 
                         if !record.attachments.is_empty() {
@@ -672,6 +703,9 @@ pub async fn check_outlook_email(
         }
     };
 
+    // 同步删除服务器上已删除的邮件
+    let deleted = sync_delete_removed_mails(pool, email_id, &folder, &server_mail_ids).await?;
+
     update_last_check_time(pool, email_id).await?;
 
     Ok(CheckResult {
@@ -679,8 +713,9 @@ pub async fn check_outlook_email(
         success: true,
         fetched,
         saved,
+        deleted,
         message: format!(
-            "成功获取 {fetched} 封邮件，新增 {saved} 封 (模式: {:?})",
+            "成功获取 {fetched} 封邮件，新增 {saved} 封，删除 {deleted} 封 (模式: {:?})",
             used_mode
         ),
     })
@@ -709,6 +744,7 @@ pub async fn batch_check_outlook_emails(
                     success: false,
                     fetched: 0,
                     saved: 0,
+                    deleted: 0,
                     message: format!("收件失败: {e}"),
                 });
             }
@@ -826,7 +862,7 @@ fn fetch_outlook_emails(
     access_token: &str,
     folder: &str,
     last_check_time: Option<String>,
-) -> Result<Vec<MailFetchRecord>> {
+) -> Result<(Vec<MailFetchRecord>, Vec<MailIdentifier>)> {
     // 使用更稳定的企业级 IMAP 服务器
     let tls = TlsConnector::builder().build()?;
     let addr = "outlook.office365.com:993"
@@ -847,6 +883,32 @@ fn fetch_outlook_emails(
 
     // 支持多文件夹
     session.select(folder)?;
+
+    // 拉取最近邮件标识用于同步删除，避免仅靠增量无法感知删除
+    let mut server_identifiers = Vec::new();
+    let mut all_ids: Vec<_> = session.search("ALL")?.into_iter().collect();
+    all_ids.sort_unstable();
+    if all_ids.len() > 100 {
+        all_ids = all_ids[all_ids.len() - 100..].to_vec();
+    }
+    if !all_ids.is_empty() {
+        let id_set = all_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let fetches =
+            session.fetch(id_set, "BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)]")?;
+        for fetch in fetches.iter() {
+            let raw = match fetch.body() {
+                Some(body) => body,
+                None => continue,
+            };
+            if let Some(identifier) = build_mail_identifier_from_headers(raw) {
+                server_identifiers.push(identifier);
+            }
+        }
+    }
 
     let criteria = match format_imap_since(&last_check_time) {
         Some(date) => format!("SINCE {}", date),
@@ -881,7 +943,7 @@ fn fetch_outlook_emails(
 
     session.logout()?;
 
-    Ok(records)
+    Ok((records, server_identifiers))
 }
 
 /// 构建邮件记录
@@ -900,6 +962,19 @@ fn build_mail_record(parsed: ParsedMail, folder: &str) -> Result<MailFetchRecord
         content,
         folder: folder.to_string(),
         attachments,
+    })
+}
+
+/// 从邮件头部构建用于同步删除的标识
+fn build_mail_identifier_from_headers(raw: &[u8]) -> Option<MailIdentifier> {
+    let parsed = mailparse::parse_mail(raw).ok()?;
+    let subject = decode_header_value(parsed.headers.get_first_value("Subject"));
+    let sender = decode_header_value(parsed.headers.get_first_value("From"));
+    let received_time = parse_received_time(parsed.headers.get_first_value("Date"));
+    Some(MailIdentifier {
+        subject,
+        sender,
+        received_time,
     })
 }
 
@@ -1072,4 +1147,191 @@ async fn insert_attachments(
     }
 
     Ok(())
+}
+
+/// 邮件标识符，用于同步删除
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MailIdentifier {
+    subject: Option<String>,
+    sender: Option<String>,
+    received_time: Option<String>,
+}
+
+/// 同步删除服务器上已删除的邮件
+/// 返回删除的邮件数量
+async fn sync_delete_removed_mails(
+    pool: &Pool<Sqlite>,
+    email_id: i64,
+    folder: &str,
+    server_mails: &[MailIdentifier],
+) -> Result<usize> {
+    use std::collections::HashSet;
+
+    if server_mails.is_empty() {
+        log::info!("同步删除: 服务器邮件为空，清理本地文件夹邮件");
+        let normalized_folder = normalize_folder_for_sync(folder);
+        let local_records = sqlx::query_as::<_, (i64, Option<String>)>(
+            "SELECT id, folder FROM mail_records WHERE email_id = ?",
+        )
+        .bind(email_id)
+        .fetch_all(pool)
+        .await?;
+
+        let mut deleted = 0usize;
+        for (mail_id, local_folder) in local_records {
+            let local_normalized = local_folder
+                .as_ref()
+                .map(|f| normalize_folder_for_sync(f))
+                .unwrap_or_else(|| "inbox".to_string());
+            if local_normalized != normalized_folder {
+                continue;
+            }
+
+            sqlx::query("DELETE FROM attachments WHERE mail_id = ?")
+                .bind(mail_id)
+                .execute(pool)
+                .await?;
+            sqlx::query("DELETE FROM mail_records WHERE id = ?")
+                .bind(mail_id)
+                .execute(pool)
+                .await?;
+
+            deleted += 1;
+        }
+
+        log::info!("同步删除完成: email_id={}, deleted={}", email_id, deleted);
+        return Ok(deleted);
+    }
+
+    // 构建服务器邮件标识集合（标准化时间格式）
+    let server_set: HashSet<_> = server_mails
+        .iter()
+        .map(|m| MailIdentifier {
+            subject: m.subject.clone(),
+            sender: m.sender.as_ref().map(|s| normalize_sender(s)),
+            received_time: m.received_time.as_ref().map(|t| normalize_time(t)),
+        })
+        .collect();
+
+    // 标准化文件夹名称用于匹配
+    let normalized_folder = normalize_folder_for_sync(folder);
+
+    log::info!("同步删除检查: email_id={}, folder={}, 服务器邮件数={}",
+        email_id, normalized_folder, server_set.len());
+
+    // 仅在服务器同步窗口内做删除对比，避免窗口外误删
+    let min_server_time = server_mails
+        .iter()
+        .filter_map(|m| m.received_time.as_deref())
+        .filter_map(|t| DateTime::parse_from_rfc3339(t).ok())
+        .map(|dt| dt.timestamp())
+        .min();
+    if min_server_time.is_none() {
+        log::warn!("同步删除跳过: 无法解析服务器邮件时间");
+        return Ok(0);
+    }
+    let min_server_time = min_server_time.unwrap();
+
+    // 查询本地该邮箱该文件夹的所有邮件
+    let local_records = sqlx::query_as::<_, (i64, Option<String>, Option<String>, Option<String>, Option<String>)>(
+        "SELECT id, subject, sender, received_time, folder FROM mail_records WHERE email_id = ?",
+    )
+    .bind(email_id)
+    .fetch_all(pool)
+    .await?;
+
+    log::info!("本地邮件数: {}", local_records.len());
+
+    let mut deleted = 0usize;
+
+    for (mail_id, subject, sender, received_time, local_folder) in local_records {
+        // 检查是否属于当前文件夹
+        let local_normalized = local_folder
+            .as_ref()
+            .map(|f| normalize_folder_for_sync(f))
+            .unwrap_or_else(|| "inbox".to_string());
+
+        if local_normalized != normalized_folder {
+            continue;
+        }
+
+        // 只比对同步窗口内的邮件，减少误删风险
+        let local_timestamp = match received_time
+            .as_deref()
+            .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+        {
+            Some(dt) => dt.timestamp(),
+            None => continue,
+        };
+        if local_timestamp < min_server_time {
+            continue;
+        }
+
+        // 构建本地邮件标识（标准化时间和发件人格式）
+        let local_identifier = MailIdentifier {
+            subject: subject.clone(),
+            sender: sender.as_ref().map(|s| normalize_sender(s)),
+            received_time: received_time.as_ref().map(|t| normalize_time(t)),
+        };
+
+        // 如果服务器上不存在该邮件，则删除
+        if !server_set.contains(&local_identifier) {
+            log::info!("同步删除邮件: mail_id={}, subject={:?}", mail_id, subject);
+
+            // 先删除附件
+            sqlx::query("DELETE FROM attachments WHERE mail_id = ?")
+                .bind(mail_id)
+                .execute(pool)
+                .await?;
+
+            // 再删除邮件记录
+            sqlx::query("DELETE FROM mail_records WHERE id = ?")
+                .bind(mail_id)
+                .execute(pool)
+                .await?;
+
+            deleted += 1;
+        }
+    }
+
+    log::info!("同步删除完成: email_id={}, deleted={}", email_id, deleted);
+    Ok(deleted)
+}
+
+/// 标准化时间格式，去除毫秒和时区差异
+fn normalize_time(time: &str) -> String {
+    // 移除毫秒部分和时区信息，只保留 YYYY-MM-DDTHH:MM:SS
+    let t = time.trim();
+    // 处理 "2024-01-01T12:00:00.000Z" 或 "2024-01-01T12:00:00+00:00" 格式
+    if let Some(pos) = t.find('.') {
+        t[..pos].to_string()
+    } else if let Some(pos) = t.find('+') {
+        t[..pos].to_string()
+    } else if t.ends_with('Z') {
+        t[..t.len()-1].to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+/// 标准化发件人格式，提取邮箱地址
+fn normalize_sender(sender: &str) -> String {
+    // 从 "Name <email@example.com>" 格式中提取邮箱
+    if let Some(start) = sender.find('<') {
+        if let Some(end) = sender.find('>') {
+            return sender[start+1..end].to_lowercase();
+        }
+    }
+    // 如果没有尖括号，直接返回小写
+    sender.trim().to_lowercase()
+}
+
+/// 标准化文件夹名称用于同步比对
+fn normalize_folder_for_sync(folder: &str) -> String {
+    let normalized = folder.trim().to_lowercase();
+    if normalized.contains("junk") || normalized.contains("spam") || normalized.contains("垃圾") {
+        "junk".to_string()
+    } else {
+        "inbox".to_string()
+    }
 }

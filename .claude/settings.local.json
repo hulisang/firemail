@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__mcp-sequentialthinking-tools__sequentialthinking_tools",
+      "mcp__ace-tool__search_context",
+      "Bash(cargo check:*)"
+    ]
+  }
+}

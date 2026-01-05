@@ -27,3 +27,4 @@ dist-ssr
 .zencoder/
 .zenflow/
 MS_OAuth2API_Next/
+.ace-tool/

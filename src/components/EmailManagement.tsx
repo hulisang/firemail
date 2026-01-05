@@ -16,6 +16,16 @@ import type { EmailAccount, MailRecord } from '../types';
 
 type MailFolder = 'INBOX' | 'JUNK';
 
+// 邮件更新事件类型
+interface MailUpdateEvent {
+    email_id: number;
+    folder: string;
+    new_count: number;
+    deleted_count: number;
+    records: MailRecord[];
+    message: string;
+}
+
 // 清理 HTML 标签，提取纯文本
 const stripHtml = (html: string | null | undefined): string => {
     if (!html) return '';
@@ -96,6 +106,11 @@ export default function EmailManagement() {
     const [mailViewerLoading, setMailViewerLoading] = useState(false);
     const [selectedMail, setSelectedMail] = useState<MailRecord | null>(null);
     const [isDetailOpen, setIsDetailOpen] = useState(false);
+
+    // 实时收件相关
+    const mailUpdateUnlistenRef = useRef<UnlistenFn | null>(null);
+    const [refreshCountdown, setRefreshCountdown] = useState(5);
+    const countdownIntervalRef = useRef<number | null>(null);
 
     // 处理拖拽导入的回调（需要 useCallback 保持引用稳定）
     const handleDropImport = useCallback(async (paths: string[]) => {
@@ -280,19 +295,77 @@ export default function EmailManagement() {
         setMailViewerOpen(true);
         setMailViewerLoading(true);
 
+        // 监听邮件更新事件
+        if (mailUpdateUnlistenRef.current) {
+            mailUpdateUnlistenRef.current();
+        }
+        mailUpdateUnlistenRef.current = await listen<MailUpdateEvent>('mail-updated', (event) => {
+            const { email_id, records, new_count, deleted_count } = event.payload;
+            if (email_id === account.id) {
+                setMailViewerRecords(records);
+                // 收到更新时重置倒计时
+                setRefreshCountdown(5);
+                if (new_count > 0) {
+                    showToast(`收到 ${new_count} 封新邮件`);
+                }
+                if (deleted_count > 0) {
+                    showToast(`已同步删除 ${deleted_count} 封邮件`);
+                }
+            }
+        });
+
         try {
             // 先触发收件操作，传递文件夹参数
             await invoke('check_outlook_email', { emailId: account.id, folder });
         } catch (error) {
             console.error('收件失败:', error);
-            // 收件失败不阻止查看已有邮件
         }
 
         // 加载邮件记录
-        loadMailViewerRecords(account.id, folder);
+        await loadMailViewerRecords(account.id, folder);
+
+        // 自动启动后台刷新（5秒间隔）
+        try {
+            await invoke('start_mail_watcher', {
+                emailId: account.id,
+                folder: folder,
+                intervalSecs: 5,
+            });
+            // 启动倒计时
+            setRefreshCountdown(5);
+            if (countdownIntervalRef.current) {
+                window.clearInterval(countdownIntervalRef.current);
+            }
+            countdownIntervalRef.current = window.setInterval(() => {
+                setRefreshCountdown((prev) => (prev <= 1 ? 5 : prev - 1));
+            }, 1000);
+        } catch (error) {
+            console.error('启动自动刷新失败:', error);
+        }
     };
 
-    const handleCloseMailbox = () => {
+    const handleCloseMailbox = async () => {
+        // 停止邮件监听器
+        if (mailViewerEmail) {
+            try {
+                await invoke('stop_mail_watcher', { emailId: mailViewerEmail.id });
+            } catch (error) {
+                console.error('停止监听失败:', error);
+            }
+        }
+
+        // 停止倒计时
+        if (countdownIntervalRef.current) {
+            window.clearInterval(countdownIntervalRef.current);
+            countdownIntervalRef.current = null;
+        }
+
+        // 取消事件监听
+        if (mailUpdateUnlistenRef.current) {
+            mailUpdateUnlistenRef.current();
+            mailUpdateUnlistenRef.current = null;
+        }
+
         setMailViewerOpen(false);
         setMailViewerEmail(null);
         setMailViewerRecords([]);
@@ -718,7 +791,13 @@ export default function EmailManagement() {
                     >
                         <div className="modal-header">
                             <div>
-                                <h3>{mailViewerEmail.email}</h3>
+                                <div className="mail-viewer-title">
+                                    <h3>{mailViewerEmail.email}</h3>
+                                    <div className="auto-refresh-indicator">
+                                        <span className="pulse-dot"></span>
+                                        <span className="auto-refresh-text">自动刷新中 {refreshCountdown}s</span>
+                                    </div>
+                                </div>
                                 <p className="text-xs text-muted-foreground">
                                     {mailViewerFolder === 'INBOX' ? t.menu.inbox : t.menu.trash}
                                 </p>
@@ -731,6 +810,7 @@ export default function EmailManagement() {
                                 <X size={20} />
                             </button>
                         </div>
+
                         <div className="modal-body">
                             {mailViewerLoading ? (
                                 <div className="loading-state">
